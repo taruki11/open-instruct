@@ -13,7 +13,11 @@ echo PATH=$PATH
 
 # python3 -c "import os, ray; print(os.path.dirname(ray.__file__))"
 
-BEAKER_LEADER_REPLICA_IP=$(getent hosts ${BEAKER_LEADER_REPLICA_HOSTNAME} | awk '{print $1}')
+# Without a hostname, `getent hosts` lists every host instead of failing, so skip the lookup.
+BEAKER_LEADER_REPLICA_IP=""
+if [ -n "$BEAKER_LEADER_REPLICA_HOSTNAME" ]; then
+    BEAKER_LEADER_REPLICA_IP=$(getent hosts ${BEAKER_LEADER_REPLICA_HOSTNAME} | awk '{print $1}')
+fi
 
 RAY_NODE_PORT=8888
 mkdir -p "$HOME/.triton/autotune"  # Create Triton autotune cache directory to silence warnings
@@ -25,23 +29,46 @@ if [ "$BEAKER_REPLICA_RANK" == "0" ]; then
 else
     echo "Starting Ray worker node $BEAKER_REPLICA_RANK"
     export RAY_ADDRESS="${BEAKER_LEADER_REPLICA_IP}:${RAY_NODE_PORT}"
-    # Start worker without --block so we can control lifecycle and exit code.
-    ray start --address="${RAY_ADDRESS}" --dashboard-host=0.0.0.0
+
+    # Exit code reported by cleanup. It stays 0 only for a head that was reachable and then went
+    # away (the normal end of a multi-node run); every setup failure sets it to 1.
+    WORKER_EXIT_CODE=0
 
     cleanup() {
-        echo "[ray_node_setup] Cleanup: stopping Ray worker and exiting 0"
+        echo "[ray_node_setup] Cleanup: stopping Ray worker and exiting ${WORKER_EXIT_CODE}"
         ray stop --force >/dev/null 2>&1 || true
         trap - TERM INT HUP EXIT
-        exit 0
+        exit "${WORKER_EXIT_CODE}"
     }
 
     trap cleanup TERM INT HUP EXIT
 
+    if [ -z "$BEAKER_LEADER_REPLICA_IP" ]; then
+        echo "[ray_node_setup] Cannot resolve the Ray head from BEAKER_LEADER_REPLICA_HOSTNAME='${BEAKER_LEADER_REPLICA_HOSTNAME}' (BEAKER_REPLICA_RANK='${BEAKER_REPLICA_RANK}'). Is 'replicas' missing from the task spec? Exiting 1."
+        WORKER_EXIT_CODE=1
+        cleanup
+    fi
+
+    # Start worker without --block so we can control lifecycle and exit code.
+    if ! ray start --address="${RAY_ADDRESS}" --dashboard-host=0.0.0.0; then
+        echo "[ray_node_setup] 'ray start --address=${RAY_ADDRESS}' failed. Exiting 1."
+        WORKER_EXIT_CODE=1
+        cleanup
+    fi
+
     echo "[ray_node_setup] Monitoring Ray head at ${RAY_ADDRESS}"
-    # Poll head availability. Exit 0 when head is gone.
+    # Poll head availability. Exit 0 once a head that was reachable is gone, exit 1 if it never was.
+    HEAD_REACHED=0
     while true; do
-        if ! ray status --address="${RAY_ADDRESS}" >/dev/null 2>&1; then
-            echo "[ray_node_setup] Head is unreachable. Stopping worker and exiting 0."
+        if ray status --address="${RAY_ADDRESS}" >/dev/null 2>&1; then
+            HEAD_REACHED=1
+        else
+            if [ "$HEAD_REACHED" == "1" ]; then
+                echo "[ray_node_setup] Head is unreachable. Stopping worker and exiting 0."
+            else
+                echo "[ray_node_setup] Head at ${RAY_ADDRESS} was never reachable. Stopping worker and exiting 1."
+                WORKER_EXIT_CODE=1
+            fi
             cleanup
         fi
         sleep 5
